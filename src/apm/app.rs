@@ -512,30 +512,6 @@ impl ApmApp {
         }
     }
 
-    pub async fn send_error_event_from_fault(
-        &self,
-        log_line: &str,
-        request_id: &str,
-        function_arn: &str,
-    ) -> Result<()> {
-        use super::error_event::generate_error_event_from_fault;
-        
-        let error_events = match generate_error_event_from_fault(log_line, request_id, function_arn) {
-            Some(events) => events,
-            None => {
-                debug!("Not a fault/timeout log, skipping error event generation");
-                return Ok(());
-            }
-        };
-
-        debug!(
-            "Sending error event for fault/timeout in request: {}",
-            request_id
-        );
-
-        self.send_error_events_buffered(error_events, request_id).await
-    }
-
     /// Send synthesized error events, buffering them for retry on failure so a
     /// transient collector error or stale run_id does not silently drop them.
     async fn send_error_events_buffered(
@@ -575,17 +551,19 @@ impl ApmApp {
     }
 
     /// Send error event for shutdown events (timeout, failure)
-    /// Used when Lambda shuts down due to timeout or platform fault
+    /// Used when Lambda shuts down due to timeout or platform fault.
+    /// `is_expected` is forwarded to `error.expected` on the generated event.
     pub async fn send_shutdown_error_event(
         &self,
         error_class: &str,
         error_message: &str,
         request_id: &str,
         function_arn: &str,
+        is_expected: bool,
     ) -> Result<()> {
         use super::error_event::generate_error_event;
 
-        let error_events = generate_error_event(error_class, error_message, request_id, function_arn);
+        let error_events = generate_error_event(error_class, error_message, request_id, function_arn, is_expected);
 
         if error_events.is_empty() {
             return Ok(());

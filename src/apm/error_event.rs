@@ -9,48 +9,20 @@ use super::id_generator::TraceIDGenerator;
 use serde_json::{json, Value};
 use tracing::debug;
 
-/// Generate error event from platform fault/timeout log
-/// Returns full APM error event structure matching Go implementation
-pub fn generate_error_event_from_fault(
-    log_line: &str,
-    request_id: &str,
-    function_arn: &str,
-) -> Option<Vec<Value>> {
-    let is_timeout = log_line.contains("Task timed out");
-    let is_fault = log_line.contains("error")
-        || log_line.contains("ERROR")
-        || log_line.contains("Error")
-        || log_line.contains("exception")
-        || log_line.contains("Exception");
-
-    if !is_timeout && !is_fault {
-        return None;
-    }
-
-    let error_message = if is_timeout {
-        "Task timed out".to_string()
-    } else {
-        extract_error_message(log_line)
-    };
-
-    let error_class = if is_timeout {
-        "LambdaTimeout"
-    } else {
-        "LambdaError"
-    };
-
-    generate_error_event_internal(error_class, &error_message, request_id, function_arn)
-}
-
 /// Generate error event directly from error class and message
-/// Used for shutdown events (timeout, failure) where we don't parse from log lines
+/// Used for shutdown events (timeout, failure) where we don't parse from log lines.
+/// `is_expected` sets `error.expected` on the event — driven by
+/// `NEW_RELIC_EXTENSION_EXPECTED_ERRORS` (see `config::parse_error_class_list`) — so
+/// New Relic excludes matching classes from error rate/Apdex while still surfacing
+/// them in Errors Inbox.
 pub fn generate_error_event(
     error_class: &str,
     error_message: &str,
     request_id: &str,
     function_arn: &str,
+    is_expected: bool,
 ) -> Vec<Value> {
-    generate_error_event_internal(error_class, error_message, request_id, function_arn)
+    generate_error_event_internal(error_class, error_message, request_id, function_arn, is_expected)
         .unwrap_or_else(Vec::new)
 }
 
@@ -60,6 +32,7 @@ fn generate_error_event_internal(
     error_message: &str,
     request_id: &str,
     function_arn: &str,
+    is_expected: bool,
 ) -> Option<Vec<Value>> {
     debug!(
         "Generating error event for request {}: {} - {}",
@@ -82,7 +55,7 @@ fn generate_error_event_internal(
     let event_detail = json!({
         "duration": 0.1,
         "error.class": error_class,
-        "error.expected": false,
+        "error.expected": is_expected,
         "error.message": error_message,
         "guid": guid,
         "nr.transactionGuid": guid,
@@ -125,21 +98,6 @@ fn extract_function_version(arn: &str) -> String {
         parts[7].to_string()
     } else {
         "$LATEST".to_string()
-    }
-}
-
-/// Extract error message from log line
-fn extract_error_message(log_line: &str) -> String {
-    if let Some(pos) = log_line.find("error:") {
-        log_line[pos..].chars().take(200).collect()
-    } else if let Some(pos) = log_line.find("ERROR") {
-        log_line[pos..].chars().take(200).collect()
-    } else if let Some(pos) = log_line.find("Error:") {
-        log_line[pos..].chars().take(200).collect()
-    } else if let Some(pos) = log_line.find("Exception:") {
-        log_line[pos..].chars().take(200).collect()
-    } else {
-        log_line.chars().take(200).collect()
     }
 }
 

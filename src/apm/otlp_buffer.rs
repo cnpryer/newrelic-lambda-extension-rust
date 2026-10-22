@@ -1,19 +1,9 @@
 // Copyright New Relic, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Retry buffer for OTLP metrics payloads sent to the OTLP endpoint (APM mode).
-//!
-//! Distinct from [`super::telemetry_buffer`], which retries APM-collector telemetry
-//! keyed by `run_id`/`collector_host`. Like [`super::metric_api_buffer`], the OTLP
-//! endpoint authenticates with the license key only (no `run_id`), so failed sends
-//! are buffered with just the payload, endpoint, and `entity.guid` and retried on
-//! later invocations and at shutdown. Transient failures (5xx/429/408/network) are
-//! buffered; permanent failures (malformed payload, other 4xx) are dropped at the
-//! send site and never reach here.
-//!
-//! Buffered per-payload (not per-batch): `send_otlp_payload` already decodes,
-//! enriches, and sends each base64 entry independently, so a failure only affects
-//! the one payload that failed, not its batch-mates.
+//! Retry buffer for OTLP payloads that failed transiently, one entry per payload,
+//! retried on later invocations and at shutdown. Like [`super::metric_api_buffer`], the
+//! endpoint authenticates with the license key alone, so an entry needs no `run_id`.
 
 use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
@@ -32,9 +22,8 @@ const MAX_BUFFERED_PAYLOADS: usize = 1000;
 /// A single OTLP payload that failed to send and must be retried.
 #[derive(Debug, Clone)]
 pub struct FailedOtlpPayload {
-    /// Base64-encoded OTLP `ExportMetricsServiceRequest` protobuf, not yet
-    /// `entity.guid`-enriched (enrichment happens on every send attempt, including
-    /// retries, since `inject_entity_guid` is idempotent).
+    /// The agent's base64 `ExportMetricsServiceRequest`; `entity.guid` is injected on each
+    /// send attempt.
     pub encoded_payload: String,
     pub entity_guid: String,
     pub otlp_metric_endpoint: String,
@@ -196,9 +185,8 @@ pub fn get_otlp_buffer_count() -> usize {
         .unwrap_or(0)
 }
 
-/// Distinct `request_id`s represented in the buffered OTLP payloads. Used so the
-/// shutdown drop summary's "invocations affected" count includes OTLP-only requests
-/// (which otherwise show up in the item count but not the invocation count).
+/// Distinct `request_id`s in the buffer, so the shutdown drop summary counts OTLP-only
+/// invocations.
 pub fn buffered_request_ids() -> Vec<String> {
     let mut ids: Vec<String> = FAILED_OTLP_BUFFER
         .lock()

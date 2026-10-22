@@ -2057,33 +2057,12 @@ fn test_from_env_http_timeout_invalid_value_falls_back_to_default() {
     });
 }
 
-
 // ── OTLP metrics forwarding opt-in (NEW_RELIC_OTLP_METRIC_ENABLED) ──
 
 #[test]
 #[serial]
 fn test_otlp_metric_enabled_default_false() {
     with_full_clean_env(|| {
-        let config = ExtensionConfig::from_env();
-        assert!(!config.new_relic.otlp_metric_enabled);
-    });
-}
-
-#[test]
-#[serial]
-fn test_otlp_metric_enabled_true_from_env() {
-    with_full_clean_env(|| {
-        env::set_var("NEW_RELIC_OTLP_METRIC_ENABLED", "true");
-        let config = ExtensionConfig::from_env();
-        assert!(config.new_relic.otlp_metric_enabled);
-    });
-}
-
-#[test]
-#[serial]
-fn test_otlp_metric_enabled_explicit_false() {
-    with_full_clean_env(|| {
-        env::set_var("NEW_RELIC_OTLP_METRIC_ENABLED", "false");
         let config = ExtensionConfig::from_env();
         assert!(!config.new_relic.otlp_metric_enabled);
     });

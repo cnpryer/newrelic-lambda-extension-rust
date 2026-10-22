@@ -73,14 +73,8 @@ pub struct NewRelicConfig {
     pub apm_host: String,
     pub metric_endpoint: String,
     pub otlp_metric_endpoint: String,
-    /// `NEW_RELIC_OTLP_METRIC_ENABLED` — feature-gates OTLP metrics forwarding
-    /// (protobuf `entity.guid` injection + send). Default: false. While
-    /// disabled, any `otlp_payload` entries the agent sends are dropped
-    /// without being decoded or forwarded.
-    ///
-    /// This is the raw env-var value. Forwarding additionally requires
-    /// `apm_lambda_mode`, since the send path lives in `ApmApp`; the effective
-    /// gate is `crate::apm::collector::is_otlp_metric_enabled()`.
+    /// `NEW_RELIC_OTLP_METRIC_ENABLED`, default false. Forwarding also requires APM mode;
+    /// see [`ExtensionConfig::otlp_metric_forwarding_active`].
     pub otlp_metric_enabled: bool,
     pub proxy_url: Option<String>,
     /// `NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH` — master switch for serverless-mode
@@ -369,13 +363,8 @@ pub(crate) fn parse_duration(raw: &str) -> Option<Duration> {
 }
 
 impl ExtensionConfig {
-    /// Whether OTLP metric forwarding will actually run: the customer opted in via
-    /// `NEW_RELIC_OTLP_METRIC_ENABLED` **and** APM mode is on. APM mode is required
-    /// because the send path lives in `ApmApp::process_agent_payload`, and no `ApmApp`
-    /// is constructed in serverless mode — so the env var alone is not sufficient.
-    ///
-    /// This is the single source of truth mirrored into
-    /// `crate::apm::collector::set_otlp_metric_enabled()` at startup.
+    /// Whether OTLP metrics are forwarded: `NEW_RELIC_OTLP_METRIC_ENABLED` and APM mode.
+    /// The send path is in `ApmApp`, which exists only in APM mode.
     pub fn otlp_metric_forwarding_active(&self) -> bool {
         self.new_relic.otlp_metric_enabled && self.new_relic.apm_lambda_mode
     }
@@ -501,7 +490,6 @@ impl ExtensionConfig {
         config.new_relic.apm_disabled_telemetry =
             parse_disabled_telemetry(&env::var("NEW_RELIC_APM_DISABLE_TELEMETRY").unwrap_or_default());
 
-        // OTLP metrics forwarding is opt-in: default false until customers explicitly enable it.
         let otlp_metric_enabled_str = env::var("NEW_RELIC_OTLP_METRIC_ENABLED").unwrap_or_default();
         config.new_relic.otlp_metric_enabled = parse_bool(&otlp_metric_enabled_str);
 

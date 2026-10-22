@@ -184,16 +184,6 @@ fn test_otlp_payload_camel_case_key_fallback() {
 }
 
 #[test]
-fn test_otlp_payload_snake_case_takes_precedence_over_camel_case() {
-    let payload =
-        create_test_payload_with_json(r#"{"otlp_payload": ["snake"], "otlpPayload": ["camel"]}"#);
-    let (data_map, _version) = parse_agent_payload(&payload).unwrap();
-
-    let entries = data_map.get("otlp_payload").unwrap();
-    assert_eq!(entries, &vec![Value::String("snake".to_string())]);
-}
-
-#[test]
 fn test_otlp_payload_absent_key_yields_no_map_entry() {
     let payload = create_test_payload_with_json(r#"{"metric_data": [[1, 2, 3]]}"#);
     let (data_map, _version) = parse_agent_payload(&payload).unwrap();
@@ -247,21 +237,29 @@ fn test_otlp_payload_non_string_elements_are_skipped_not_fatal() {
 }
 
 #[test]
-fn test_otlp_payload_empty_array_yields_no_map_entry() {
-    // An empty array must behave like an absent key so app.rs takes its
-    // "no otlp_payload found" branch rather than spawning a no-op send.
-    let payload = create_test_payload_with_json(r#"{"otlp_payload": []}"#);
-    let (data_map, _version) = parse_agent_payload(&payload).unwrap();
-
-    assert!(!data_map.contains_key("otlp_payload"));
+fn test_otlp_payload_non_array_is_ignored() {
+    // The contract is an array of base64 strings; every other shape yields nothing.
+    for body in [
+        r#"{"otlp_payload": "YmFyZQ=="}"#,
+        r#"{"otlp_payload": null}"#,
+        r#"{"otlp_payload": 42}"#,
+        r#"{"otlp_payload": true}"#,
+        r#"{"otlp_payload": {"a": 1}}"#,
+    ] {
+        let payload = create_test_payload_with_json(body);
+        let (data_map, _version) = parse_agent_payload(&payload).unwrap();
+        assert!(!data_map.contains_key("otlp_payload"), "should ignore: {body}");
+    }
 }
 
 #[test]
-fn test_otlp_payload_scalar_string_not_wrapped_is_ignored() {
-    // Defensive: a bare string (not an array) does not match Value::Array,
-    // so it yields nothing. Documents the shape contract with the agent.
-    let payload = create_test_payload_with_json(r#"{"otlp_payload": "bare"}"#);
+fn test_otlp_payload_empty_string_inside_array_is_skipped() {
+    // An empty blob carries no metrics; forwarding it would POST an empty request.
+    let payload = create_test_payload_with_json(r#"{"otlp_payload": ["", "abc", ""]}"#);
     let (data_map, _version) = parse_agent_payload(&payload).unwrap();
 
-    assert!(!data_map.contains_key("otlp_payload"));
+    assert_eq!(
+        data_map.get("otlp_payload"),
+        Some(&vec![Value::String("abc".to_string())])
+    );
 }

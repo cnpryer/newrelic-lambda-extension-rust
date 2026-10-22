@@ -357,9 +357,8 @@ async fn perform_one_time_initialization(
     // Detect EU endpoints from license key prefix
     let license_key_prefix = license_key.get(0..2);
 
-    // OTLP metrics ingest at `/v1/metrics` on the APM collector host, so otlp_metric_endpoint
-    // follows apm_host rather than being configured separately. NEW_RELIC_OTLP_METRIC_ENDPOINT
-    // (applied below) still overrides this for anyone who needs a different host.
+    // OTLP is ingested at /v1/metrics on the APM collector host; NEW_RELIC_OTLP_METRIC_ENDPOINT
+    // below overrides it.
     if let Ok(host) = env::var("NEW_RELIC_HOST") {
         updated_config.new_relic.otlp_metric_endpoint = format!("https://{host}/v1/metrics");
         updated_config.new_relic.apm_host = host;
@@ -502,10 +501,7 @@ async fn perform_one_time_initialization(
     // ExtensionConfig in scope (telemetry listener) can honor the customer's exclusions.
     apm::collector::set_disabled_telemetry(config.new_relic.apm_disabled_telemetry.clone());
 
-    // Mirror the *effective* OTLP capability (env var AND APM mode), not just the env var,
-    // so is_otlp_metric_enabled() answers "will OTLP actually be sent?" rather than "did the
-    // customer ask for it?". Warn on the mismatch — otherwise a customer who sets the flag
-    // in serverless mode gets no metrics and no explanation.
+    // A flag set without APM mode would otherwise yield no metrics and no explanation.
     if config.new_relic.otlp_metric_enabled && !config.new_relic.apm_lambda_mode {
         warn!(
             "NEW_RELIC_OTLP_METRIC_ENABLED=true but APM mode is disabled - OTLP metric \

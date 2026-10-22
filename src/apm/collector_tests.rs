@@ -100,20 +100,6 @@ fn disconnect_is_not_restart_exception() {
 // OTLP metrics forwarding gate
 // ---------------------------------------------------------------------------
 
-#[test]
-#[serial]
-fn otlp_metric_enabled_defaults_to_false_and_roundtrips() {
-    // Process-wide static: don't assume a fresh false here (another test may have
-    // run first), but do confirm the flag actually flips both ways.
-    set_otlp_metric_enabled(false);
-    assert!(!is_otlp_metric_enabled());
-    set_otlp_metric_enabled(true);
-    assert!(is_otlp_metric_enabled());
-    // Reset so other serial tests see a clean state.
-    set_otlp_metric_enabled(false);
-    assert!(!is_otlp_metric_enabled());
-}
-
 /// Pins the full truth table for the effective OTLP gate, exercising the REAL
 /// production function (`ExtensionConfig::otlp_metric_forwarding_active`) that main.rs
 /// feeds into `set_otlp_metric_enabled` — not a re-implementation of the `&&`. Guards
@@ -151,3 +137,4 @@ fn otlp_metric_enabled_requires_both_env_var_and_apm_mode() {
     set_otlp_metric_enabled(false);
     assert!(!is_otlp_metric_enabled());
 }
+

@@ -22,7 +22,7 @@ use reqwest::Client;
 use serde_json::Value;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 #[derive(Debug)]
 pub struct ApmApp {
@@ -315,10 +315,8 @@ impl ApmApp {
 
         let mut send_tasks = Vec::new();
 
-        // OTLP metric forwarding requires NEW_RELIC_OTLP_METRIC_ENABLED *and* APM mode; the
-        // gate below reflects both (see ExtensionConfig::otlp_metric_forwarding_active). When
-        // it is off, drop any otlp_payload entries here — before the generic telemetry loop
-        // below, which would otherwise log them as an "Unknown telemetry type".
+        // otlp_payload is removed from the map either way, so the generic loop below does not
+        // report it as an unknown telemetry type.
         if super::collector::is_otlp_metric_enabled() {
             let otlp_entries: Vec<String> = telemetry_map
                 .remove("otlp_payload")
@@ -328,43 +326,26 @@ impl ApmApp {
                 .collect();
 
             if otlp_entries.is_empty() {
-                // OTLP is switched on but the agent sent no otlp_payload. The customer opted
-                // in and is getting nothing, so surface it rather than staying silent — the
-                // usual cause is an agent that does not emit this field (only the .NET Hybrid
-                // Agent does today) or an app that never records OTEL metrics.
+                // Opted in but nothing to send: an agent without OTLP support, a bridge that
+                // did not start, or an app recording no OpenTelemetry metrics.
                 warn!(
                     "NEW_RELIC_OTLP_METRIC_ENABLED=true but no otlp_payload found in the agent \
                      payload for request {} - no OTLP metrics to forward",
                     request_id
                 );
             } else {
-                info!(
-                    "Sending {} OTLP payload(s) to OTLP endpoint (entity.guid={})",
-                    otlp_entries.len(),
-                    self.entity_guid,
-                );
-                debug!(
-                    "OTLP endpoint: {}",
-                    self.otlp_metric_endpoint,
-                );
                 let client = self.client.clone();
                 let otlp_metric_endpoint = self.otlp_metric_endpoint.clone();
                 let license_key = self.license_key.clone();
                 let entity_guid = self.entity_guid.clone();
                 let request_id_owned = request_id.to_string();
 
-                // send_otlp_payload sends every entry concurrently. Permanent failures are
-                // logged and dropped; transient/network failures are buffered for retry on
-                // a later invoke or at shutdown (see otlp_buffer). There is no outer Result
-                // to handle here.
                 send_tasks.push(tokio::spawn(async move {
                     send_otlp_payload(&client, &otlp_metric_endpoint, &license_key, &otlp_entries, &entity_guid, &request_id_owned).await;
                 }));
             }
         } else if let Some(dropped) = telemetry_map.remove("otlp_payload") {
-            // Not a misconfiguration on its own: the customer simply has not opted in, so
-            // this stays at debug. The "flag set but APM mode off" mismatch is warned about
-            // once at startup in main.rs instead of once per invocation here.
+            // Not opted in, so debug only. Flag-without-APM-mode warns once at startup.
             debug!(
                 "Dropping {} OTLP payload(s) - OTLP forwarding is not enabled",
                 dropped.len()

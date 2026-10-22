@@ -104,21 +104,16 @@ pub fn is_telemetry_disabled(telemetry_type: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Process-wide OTLP feature gate, populated once at startup (default false). True only
-/// when `NEW_RELIC_OTLP_METRIC_ENABLED` **and** `NEW_RELIC_APM_LAMBDA_MODE` are both set —
-/// the forwarding code lives in `ApmApp::process_agent_payload`, which does not exist in
-/// serverless mode, so the env var alone is not sufficient. Lets code paths without
-/// `ExtensionConfig` in scope check whether OTLP forwarding will actually happen.
+/// Process-wide copy of `ExtensionConfig::otlp_metric_forwarding_active()`, for code
+/// without the config in scope.
 static OTLP_METRIC_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Record whether OTLP metrics forwarding is enabled (called once at startup).
-/// Callers pass the effective value (env var AND APM mode), not the raw env var.
+/// Set once at startup.
 pub fn set_otlp_metric_enabled(enabled: bool) {
     OTLP_METRIC_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Whether OTLP metric forwarding is active: `NEW_RELIC_OTLP_METRIC_ENABLED` is set AND
-/// APM mode is on. False in serverless mode even if the env var is set.
+/// Whether OTLP metrics are forwarded.
 pub fn is_otlp_metric_enabled() -> bool {
     OTLP_METRIC_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -183,19 +178,23 @@ impl std::error::Error for MetricApiError {}
 
 /// Outcome classification for an OTLP payload send failure. Mirrors `MetricApiError`
 /// (same license-key-only auth model, no `run_id`/collector reconnect semantics).
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum OtlpError {
     /// Transient failure (5xx/429/408) — safe to retry.
+    #[error("OTLP transient error (status {status})")]
     Retryable {
         status: u16,
         retry_after: Option<std::time::Duration>,
     },
     /// Permanent failure (4xx other than 429/408) — retrying will not help.
+    #[error("OTLP permanent error (status {status})")]
     Permanent { status: u16 },
     /// Transport/network/timeout error — safe to retry.
+    #[error("OTLP network error: {0}")]
     Network(anyhow::Error),
     /// Malformed payload (bad base64, invalid protobuf) — retrying the same bytes
     /// will never succeed.
+    #[error("OTLP malformed payload: {0}")]
     MalformedPayload(anyhow::Error),
 }
 
@@ -211,22 +210,6 @@ impl OtlpError {
     }
 }
 
-impl std::fmt::Display for OtlpError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OtlpError::Retryable { status, .. } => {
-                write!(f, "OTLP transient error (status {status})")
-            }
-            OtlpError::Permanent { status } => {
-                write!(f, "OTLP permanent error (status {status})")
-            }
-            OtlpError::Network(e) => write!(f, "OTLP network error: {e}"),
-            OtlpError::MalformedPayload(e) => write!(f, "OTLP malformed payload: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for OtlpError {}
 
 /// Send error event telemetry to APM collector
 /// Error events have a special structure: [run_id, {events_seen, reservoir_size}, [events]]
@@ -514,20 +497,11 @@ pub async fn send_platform_metrics(
         })
     }
 }
-/// Decode, enrich with `entity.guid`, gzip, and POST a single base64-encoded OTLP payload.
-/// `payload_num` is a 1-based index used only for human-readable logging.
+/// Decode, enrich with `entity.guid`, gzip, and POST one base64 OTLP payload.
+/// `payload_num` is a 1-based index for logs.
 ///
-/// Uses the same 20 s HTTP timeout as `send_error_events` / `send_apm_telemetry` /
-/// `send_platform_metrics`, on both the first attempt and buffered retries.
-///
-/// Note on the shutdown path: `retry_buffered_otlp_payloads` also runs from the SHUTDOWN
-/// handler, whose whole budget is `SHUTDOWN_TIMEOUT_MS - SHUTDOWN_DIAG_RESERVE_MS`
-/// (1300 ms) shared with the telemetry- and metric-API drains that run first. A 20 s
-/// timeout exceeds that window, so a stalled endpoint means the shutdown drain is
-/// best-effort — the enclosing `tokio::time::timeout` cuts it off and anything undelivered
-/// stays buffered (bounded by `MAX_RETRY_ATTEMPTS` / `MAX_AGE_MINUTES`). That limitation is
-/// shared by all three buffers, not specific to OTLP; shortening only this one would make
-/// OTLP inconsistent with its siblings without fixing the budget.
+/// The 20 s timeout matches the other senders. At SHUTDOWN the enclosing timeout bounds
+/// the retry drain, and anything undelivered stays buffered.
 pub(super) async fn send_single_otlp_payload(
     client: &Client,
     otlp_metric_endpoint: &str,
@@ -622,11 +596,8 @@ pub(super) async fn send_single_otlp_payload(
         return Err(OtlpError::Permanent { status: status_code });
     }
 
-    // Matches how the other senders in this module report success (one line). The body
-    // is read only when DEBUG is on: a 2xx carries nothing we act on, so reading it
-    // unconditionally would allocate on every successful send to feed a log line that
-    // is filtered out at the default `info` level. `chars().take()` keeps the preview on
-    // a char boundary, so a multi-byte UTF-8 body cannot panic here.
+    // A 2xx body carries nothing we act on, so it is read only for the debug log.
+    // `chars().take()` keeps the preview on a char boundary for multi-byte UTF-8.
     if tracing::enabled!(tracing::Level::DEBUG) {
         let body = response.text().await.unwrap_or_default();
         let preview: String = body.trim().chars().take(256).collect();
@@ -640,19 +611,10 @@ pub(super) async fn send_single_otlp_payload(
     Ok(())
 }
 
-/// Forward base64-encoded OTLP `ExportMetricsServiceRequest` protobuf payloads to the OTLP
-/// endpoint.  Before sending, `entity.guid` is injected into every `ResourceMetrics.resource`
-/// so New Relic can correlate the metrics with the Lambda entity.  All metric data
-/// (`scope_metrics`, data points, histograms) is preserved bit-for-bit.
-///
-/// Payloads are sent concurrently and independently: one payload's failure (a transient
-/// 5xx, a timeout) does not abort or delay the others, matching the fan-out pattern used
-/// elsewhere in this codebase (see `event_loop.rs`'s late-agent-payload `JoinSet` usage).
-/// Transient/network failures are buffered via [`super::otlp_buffer`] for retry on a later
-/// invoke or at shutdown, mirroring [`super::metric_api_buffer`]'s handling of platform
-/// metrics. Permanent failures (malformed payload, non-retryable 4xx) are dropped at the
-/// send site. This function itself never returns an error, since a partial-batch failure
-/// is not a reason to fail the whole send.
+/// Send each base64 `ExportMetricsServiceRequest` concurrently, with `entity.guid` injected
+/// so New Relic attributes the metrics to the Lambda entity. Transient failures are buffered
+/// for retry ([`super::otlp_buffer`]); permanent ones are logged and dropped. Returns how
+/// many the endpoint accepted.
 pub async fn send_otlp_payload(
     client: &Client,
     otlp_metric_endpoint: &str,
@@ -660,17 +622,10 @@ pub async fn send_otlp_payload(
     payloads: &[String],
     entity_guid: &str,
     request_id: &str,
-) {
+) -> usize {
     if payloads.is_empty() {
-        return;
+        return 0;
     }
-
-    info!(
-        "Sending {} OTLP payload(s) to {} (entity.guid={})",
-        payloads.len(),
-        otlp_metric_endpoint,
-        entity_guid,
-    );
 
     let mut set = tokio::task::JoinSet::new();
     for (i, encoded) in payloads.iter().enumerate() {
@@ -693,9 +648,10 @@ pub async fn send_otlp_payload(
             )
             .await
             {
-                Ok(()) => {}
+                Ok(()) => true,
                 Err(e) if e.is_permanent() => {
                     error!("OTLP payload {} dropped (permanent): {}", payload_num, e);
+                    false
                 }
                 Err(e) => {
                     let retry_after = e.retry_after();
@@ -706,15 +662,28 @@ pub async fn send_otlp_payload(
                         request_id,
                         retry_after,
                     );
+                    false
                 }
             }
         });
     }
-    while set.join_next().await.is_some() {}
 
-    info!("Finished sending {} OTLP payload(s)", payloads.len());
+    let mut accepted = 0;
+    while let Some(joined) = set.join_next().await {
+        if joined.unwrap_or(false) {
+            accepted += 1;
+        }
+    }
 
-
+    // One line per invocation. Each failure has already logged its own cause above.
+    info!(
+        "Sent {}/{} OTLP payload(s) to {} (entity.guid={})",
+        accepted,
+        payloads.len(),
+        otlp_metric_endpoint,
+        entity_guid,
+    );
+    accepted
 }
 
 #[cfg(test)]

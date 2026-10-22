@@ -212,12 +212,17 @@ impl<'de> serde::Deserialize<'de> for LambdaData {
             }
         }
 
+        /// Collect an array of base64 blobs. Any other shape yields nothing.
+        ///
+        /// Non-string elements are skipped so one malformed entry cannot discard its
+        /// siblings, and empty strings are skipped because they carry no metrics.
         fn get_string_array(map: &HashMap<String, Value>, snake_case: &str, camel_case: &str) -> Vec<String> {
-            let value = map.get(snake_case).or_else(|| map.get(camel_case));
-            match value {
+            match map.get(snake_case).or_else(|| map.get(camel_case)) {
                 Some(Value::Array(arr)) => arr
                     .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
+                    .filter_map(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
                     .collect(),
                 _ => Vec::new(),
             }

@@ -514,6 +514,43 @@ async fn test_send_logs_client_error_returns_client_rejected() {
     );
 }
 
+/// NR-617743 plumbing test: a genuine connect failure during `send_logs`
+/// must flip the process-global post-quantum TLS fallback flag — proving
+/// `send_payload_raw`'s error branch actually wires into
+/// `tls_fallback::classify_and_maybe_flip`, not just that the retry logic
+/// itself handles network errors (already covered by the tests around it).
+/// Can't exercise the full "classical client then succeeds" recovery here:
+/// wiremock serves plain `http://`, so TLS/crypto config never engages —
+/// that half is inherently only reproducible against a real TLS-inspecting
+/// middlebox, not a local mock.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn test_send_logs_connect_failure_flips_post_quantum_tls_fallback_flag() {
+    crate::newrelic::tls_fallback::reset_for_test();
+
+    let mut config = crate::config::ExtensionConfig::default();
+    config.new_relic.license_key = Some("test-key".to_string());
+    // Nothing listens on port 1 — guaranteed connection refused, no live server needed.
+    config.new_relic.log_endpoint = "http://127.0.0.1:1".to_string();
+    let client = NewRelicClient::new(&config);
+
+    let batch = vec![crate::newrelic::payload::LogMessage {
+        timestamp: 0,
+        message: "test".to_string(),
+        attributes: serde_json::Map::new(),
+    }];
+    let result = client
+        .send_logs(&config, &batch, "arn:aws:lambda:us-east-1:123456789012:function:f")
+        .await;
+
+    assert!(matches!(result, Err(SendError::Network(_))));
+    assert!(
+        crate::newrelic::tls_fallback::is_classical_tls_active_for_test(),
+        "a genuine connect failure during send_logs must flip the post-quantum TLS fallback flag"
+    );
+    crate::newrelic::tls_fallback::reset_for_test();
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn test_send_logs_server_error_returns_server_exhausted() {
     use wiremock::matchers::method;

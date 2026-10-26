@@ -223,6 +223,57 @@ mod tests {
         reset_for_test();
     }
 
+    /// Faithfully reproduces the NR-617743 failure *signature* at the TCP
+    /// level: the connection is accepted (unlike `is_connect()` failures,
+    /// where it's refused outright), but the server then sends nothing back
+    /// at all — the same "`ClientHello` goes out, then silence" shape as a
+    /// middlebox swallowing the post-quantum `ClientHello`, just without real
+    /// TLS involved (a local test can't engage real TLS/firewall behavior;
+    /// see the module doc). This specifically exercises `is_timeout()`,
+    /// which `classify_and_maybe_flip_ignores_non_network_errors` above does
+    /// not — that test only covers the immediate-refusal (`is_connect()`)
+    /// case, a different reqwest error path.
+    #[tokio::test]
+    #[serial]
+    async fn classify_and_maybe_flip_detects_connect_then_silence_timeout() {
+        reset_for_test();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("listener has a local addr");
+
+        // Accept the connection and then just hold it open, sending nothing —
+        // the client's request will hang until its own timeout fires.
+        tokio::spawn(async move {
+            if let Ok((socket, _)) = listener.accept().await {
+                // Keep the socket alive (don't drop it, which would send a RST/FIN)
+                // for longer than the client's timeout below.
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                drop(socket);
+            }
+        });
+
+        let err = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .expect("client builds")
+            .get(format!("http://{addr}"))
+            .send()
+            .await
+            .expect_err("a server that accepts and never responds must time out");
+
+        assert!(err.is_timeout(), "expected a timeout error, got: {err:?}");
+
+        let flipped = classify_and_maybe_flip(&err);
+        assert!(
+            flipped,
+            "connect-then-silence-then-timeout is exactly the signature this fallback exists to catch"
+        );
+        assert!(USE_CLASSICAL_TLS.load(Ordering::Relaxed));
+        reset_for_test();
+    }
+
     #[tokio::test]
     #[serial]
     async fn classify_and_maybe_flip_ignores_decode_errors() {

@@ -26,7 +26,7 @@
 use rustls::crypto::aws_lc_rs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 /// Sticky, process-global: once true, every [`DualTlsClient::active`] call in
 /// this warm execution environment returns the classical-only client. Never
@@ -75,7 +75,7 @@ pub fn classify_and_maybe_flip(err: &reqwest::Error) -> bool {
         return true;
     }
 
-    info!(
+    debug!(
         "Outbound send to {} failed to connect/complete its TLS handshake ({err}) — switching \
          to classical-only TLS key exchange (no post-quantum hybrid group) for the rest of this \
          execution environment's life (NR-617743)",
@@ -155,6 +155,37 @@ pub(crate) fn is_classical_tls_active_for_test() -> bool {
 #[cfg(test)]
 pub(crate) fn test_client() -> DualTlsClient {
     DualTlsClient::build(reqwest::Client::builder)
+}
+
+/// Not run by default (`cargo test`) — requires real outbound internet access
+/// and hits a live third-party endpoint, which this crate's test suite
+/// otherwise never does (everything else uses `wiremock` locally). Exists to
+/// answer one specific question that no local mock can: does the
+/// classical-only `ClientConfig` (custom `CryptoProvider` + hand-wired
+/// `rustls_platform_verifier`) actually complete a real TLS handshake and
+/// certificate verification against a real endpoint, or did something in
+/// its manual construction break normal connectivity for the 100% of
+/// customers who'd only ever see this path invoked for real after a flip.
+/// Run on demand: `cargo test --lib tls_fallback -- --ignored`.
+#[cfg(test)]
+#[ignore = "requires real outbound internet access; run on demand, not in CI"]
+#[tokio::test]
+async fn classical_only_client_completes_a_real_tls_handshake() {
+    let client = DualTlsClient::build(reqwest::Client::builder);
+    let response = client
+        .classical
+        .get("https://collector.newrelic.com/")
+        .send()
+        .await
+        .expect(
+            "classical-only TLS config must be able to complete a real handshake \
+             against a real endpoint — any HTTP response (even non-2xx) proves \
+             TLS + cert verification succeeded",
+        );
+    // Any status at all (404 is expected for a bare GET to this path) proves the
+    // full TLS handshake and certificate chain verification completed — that's
+    // the only thing this test is checking.
+    let _ = response.status();
 }
 
 #[cfg(test)]

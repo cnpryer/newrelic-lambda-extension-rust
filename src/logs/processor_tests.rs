@@ -2631,3 +2631,100 @@ mod coverage_tests {
         assert_eq!(p.log_batch.lock().unwrap().len(), 0, "batch cleared after dedup + send");
     }
 }
+
+/// JSON function logs on Telemetry API schema 2025-01-29. The records below are what the
+/// Telemetry API delivers for a Node.js function with AWS_LAMBDA_LOG_FORMAT=JSON.
+#[cfg(test)]
+mod record_message_tests {
+    use super::super::{record_message, LogProcessor};
+    use crate::config::ExtensionConfig;
+    use crate::context::InvocationContext;
+    use crate::newrelic::client::NewRelicClient;
+    use crate::telemetry::listener::TelemetryRecord;
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    fn processor() -> LogProcessor {
+        let mut config = ExtensionConfig::default();
+        config.new_relic.log_endpoint = "http://127.0.0.1:1/log/v1".to_string();
+        config.extension.send_function_logs = true;
+        let config = Arc::new(config);
+        let client = Arc::new(NewRelicClient::new(&config));
+        let ctx = Arc::new(Mutex::new(InvocationContext {
+            request_id: "req-json".to_string(),
+            invoked_function_arn: "arn:aws:lambda:us-east-1:123:function:f".to_string(),
+            trace_id: None,
+        }));
+        LogProcessor::new(client, config, ctx, None)
+    }
+
+    #[test]
+    fn record_message_console_object_uses_message() {
+        let record = json!({
+            "timestamp": "2026-10-27T20:05:31.072Z", "level": "INFO",
+            "requestId": "3ba9500e", "message": {"custom": "object-field", "n": 1}
+        });
+        assert_eq!(record_message(&record), r#"{"custom":"object-field","n":1}"#);
+    }
+
+    #[test]
+    fn record_message_console_string_uses_message() {
+        let record = json!({
+            "timestamp": "2026-10-27T20:05:31.091Z", "level": "INFO",
+            "requestId": "3ba9500e", "message": "{\"message\":\"string-message\",\"custom\":\"inside-string\"}"
+        });
+        assert_eq!(
+            record_message(&record),
+            "{\"message\":\"string-message\",\"custom\":\"inside-string\"}"
+        );
+    }
+
+    #[test]
+    fn record_message_stdout_json_keeps_application_fields() {
+        // process.stdout.write(JSON.stringify(...)): the application's fields are the record.
+        let record = json!({
+            "level": "info", "message": "stdout-message", "custom": "sibling-field", "n": 3
+        });
+        let message: serde_json::Value =
+            serde_json::from_str(&record_message(&record)).expect("message is JSON");
+        assert_eq!(message, record);
+    }
+
+    #[test]
+    fn record_message_object_without_message_is_serialized() {
+        let record = json!({"requestId": "r-1", "metrics": {"durationMs": 1.5}});
+        let message: serde_json::Value =
+            serde_json::from_str(&record_message(&record)).expect("message is JSON");
+        assert_eq!(message, record);
+    }
+
+    #[test]
+    fn record_message_string_record_is_unchanged() {
+        let record = json!("2026-10-27T20:05:31.072Z\t3ba9500e\tINFO\tplain text");
+        assert_eq!(
+            record_message(&record),
+            "2026-10-27T20:05:31.072Z\t3ba9500e\tINFO\tplain text"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_record_stdout_json_keeps_application_fields() {
+        let p = processor();
+        let record = json!({
+            "level": "info", "message": "Handled request",
+            "logger": "cerbos.grpc", "grpc.method": "CheckResources"
+        });
+        let rec = TelemetryRecord {
+            time: chrono::DateTime::from_timestamp(0, 0).expect("epoch"),
+            record_type: "function".to_string(),
+            record: record.clone(),
+        };
+        p.process_record(rec).await;
+        let batch = p.log_batch.lock().unwrap();
+        assert_eq!(batch.len(), 1);
+        let message: serde_json::Value =
+            serde_json::from_str(&batch[0].message).expect("message is JSON");
+        assert_eq!(message, record, "application fields are forwarded");
+        assert_eq!(batch[0].attributes.get("level"), Some(&json!("INFO")));
+    }
+}

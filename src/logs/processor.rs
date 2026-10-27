@@ -419,6 +419,30 @@ fn get_structured_log_level(record: &serde_json::Value) -> Option<String> {
     None
 }
 
+/// Keys the Lambda runtime writes when it wraps a `console.*` call in a JSON log record.
+const RUNTIME_RECORD_KEYS: &[&str] = &["timestamp", "level", "requestId", "message"];
+
+/// Build the log message for a telemetry record.
+///
+/// On Telemetry API schema 2022-12-13 and later, a JSON log line arrives as an object. When
+/// the runtime wrapped a `console.*` call, the application's output is under `message`. When
+/// the application wrote JSON itself (for example with `process.stdout.write`), its fields sit
+/// next to `message`, so the whole record is forwarded and New Relic parses it on ingest, as it
+/// does for records rendered as strings on older schemas.
+fn record_message(record: &serde_json::Value) -> String {
+    match record {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Object(obj) if obj.keys().all(|k| RUNTIME_RECORD_KEYS.contains(&k.as_str())) => {
+            match obj.get("message") {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(other) => other.to_string(),
+                None => record.to_string(),
+            }
+        }
+        other => other.to_string(),
+    }
+}
+
 impl LogProcessor {
     
    
@@ -858,19 +882,7 @@ impl LogProcessor {
         
         // Compute message string ONCE, passed to to_log_message to avoid
         // double-serialization of non-String records.
-        let message_owned: String = match &record.record {
-            serde_json::Value::String(s) => s.clone(),
-            serde_json::Value::Object(obj) => {
-                if let Some(serde_json::Value::String(s)) = obj.get("message") {
-                    s.clone()
-                } else if let Some(other) = obj.get("message") {
-                    other.to_string()
-                } else {
-                    serde_json::to_string(&record.record).unwrap_or_default()
-                }
-            }
-            other => other.to_string(),
-        };
+        let message_owned: String = record_message(&record.record);
 
         if let Some(mut log_message) = self.to_log_message_with_msg(&record, message_owned.clone()) {
             // Per-record request id (JSON logs >= 2022-12-13 carry `requestId`; some runtimes

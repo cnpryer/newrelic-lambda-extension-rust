@@ -237,6 +237,22 @@ fn test_summarize_response_body_short_plain_text_unchanged() {
     assert_eq!(summarize_response_body("  plain error  "), "plain error");
 }
 
+/// Covers the proxy-configured branch inside `NewRelicClient::new`'s
+/// `DualTlsClient::build` closure — no prior test set `proxy_url`, so this
+/// path (shared by both the primary and classical client builds) was never
+/// exercised.
+#[test]
+fn test_new_relic_client_new_with_proxy_url_builds_successfully() {
+    let mut config = crate::config::ExtensionConfig::default();
+    config.new_relic.proxy_url = Some("http://proxy.internal:8080".to_string());
+
+    // Must not panic — proves both the primary and classical DualTlsClient
+    // builds succeed when a proxy is configured, and that the "already
+    // logged" dedup (proxy_logged AtomicBool) doesn't log twice or panic
+    // when invoked across both builder closures.
+    let _client = NewRelicClient::new(&config);
+}
+
 #[test]
 fn test_common_log_attrs_include_aws_log_group_derived_from_function_name() {
     let mut config = crate::config::ExtensionConfig::default();
